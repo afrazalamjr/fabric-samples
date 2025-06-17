@@ -10,9 +10,14 @@ import * as crypto from 'crypto';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { TextDecoder } from 'util';
+import express from 'express';
+import bodyParser from 'body-parser';
+
+const app = express();
+app.use(bodyParser.json());
 
 const channelName = envOrDefault('CHANNEL_NAME', 'mychannel');
-const chaincodeName = envOrDefault('CHAINCODE_NAME', 'basic');
+const chaincodeName = envOrDefault('CHAINCODE_NAME', 'application');
 const mspId = envOrDefault('MSP_ID', 'Org1MSP');
 
 // Path to crypto materials.
@@ -92,11 +97,175 @@ async function main(): Promise<void> {
     }
 }
 
-main().catch((error: unknown) => {
-    console.error('******** FAILED to run the application:', error);
-    process.exitCode = 1;
+// Express Routes for Postman
+app.post('/initLedger', async (req:any, res:any) => {
+    try {
+        const client = await newGrpcConnection();
+        const gateway = connect({
+            client,
+            identity: await newIdentity(),
+            signer: await newSigner(),
+            hash: hash.sha256,
+        });
+
+        const network = gateway.getNetwork(channelName);
+        const contract = network.getContract(chaincodeName);
+        
+        await initLedger(contract);
+        res.status(200).json({ message: 'Ledger initialized successfully' });
+        
+        gateway.close();
+        client.close();
+    } catch (error) {
+        res.status(404).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+    }
 });
 
+app.get('/getAllAssets', async (req:any, res:any) => {
+    try {
+        const client = await newGrpcConnection();
+        const gateway = connect({
+            client,
+            identity: await newIdentity(),
+            signer: await newSigner(),
+            hash: hash.sha256,
+        });
+
+        const network = gateway.getNetwork(channelName);
+        const contract = network.getContract(chaincodeName);
+        
+        const resultBytes = await contract.evaluateTransaction('GetAllAssets');
+        const resultJson = utf8Decoder.decode(resultBytes);
+        
+        res.status(200).json(JSON.parse(resultJson));
+        
+        gateway.close();
+        client.close();
+    } catch (error) {
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+    }
+});
+
+app.post('/createAsset', async (req:any, res:any) => {
+    try {
+        const { color, quantity, name, size } = req.body;
+        
+        if (!color || !quantity || !name || !size) {
+            return res.status(400).json({ error: 'Missing required fields: color, quantity, name, size' });
+        }
+        
+        const client = await newGrpcConnection();
+        const gateway = connect({
+            client,
+            identity: await newIdentity(),
+            signer: await newSigner(),
+            hash: hash.sha256,
+        });
+
+        const network = gateway.getNetwork(channelName);
+        const contract = network.getContract(chaincodeName);
+        
+        await contract.submitTransaction(
+            'CreateAsset',
+            `asset${Date.now()}`,
+            color,
+            quantity,
+            name,
+            size
+        );
+        
+        res.status(200).json({ message: 'Asset created successfully' });
+        
+        gateway.close();
+        client.close();
+    } catch (error) {
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+    }
+});
+
+app.get('/readAsset/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        const client = await newGrpcConnection();
+        const gateway = connect({
+            client,
+            identity: await newIdentity(),
+            signer: await newSigner(),
+            hash: hash.sha256,
+        });
+
+        const network = gateway.getNetwork(channelName);
+        const contract = network.getContract(chaincodeName);
+        
+        const resultBytes = await contract.evaluateTransaction('ReadAsset', id);
+        const resultJson = utf8Decoder.decode(resultBytes);
+        
+        res.status(200).json(JSON.parse(resultJson));
+        
+        gateway.close();
+        client.close();
+    } catch (error) {
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+    }
+});
+
+app.post('/transferAsset', async (req, res) => {
+    try {
+        const { assetId, newOwner } = req.body;
+        
+        if (!assetId || !newOwner) {
+            return res.status(400).json({ error: 'Missing required fields: assetId, newOwner' });
+        }
+        
+        const client = await newGrpcConnection();
+        const gateway = connect({
+            client,
+            identity: await newIdentity(),
+            signer: await newSigner(),
+            hash: hash.sha256,
+        });
+
+        const network = gateway.getNetwork(channelName);
+        const contract = network.getContract(chaincodeName);
+        
+        const commit = await contract.submitAsync('TransferAsset', {
+            arguments: [assetId, newOwner],
+        });
+        
+        const oldOwner = utf8Decoder.decode(commit.getResult());
+        const status = await commit.getStatus();
+        
+        if (!status.successful) {
+            throw new Error(`Transaction failed with status code ${String(status.code)}`);
+        }
+
+        res.status(200).json({ 
+            message: 'Asset transferred successfully',
+            oldOwner,
+            newOwner
+        });
+        
+        gateway.close();
+        client.close();
+    } catch (error) {
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+    }
+});
+
+// Start the server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+    console.log('Available endpoints:');
+    console.log(`- POST   /initLedger`);
+    console.log(`- GET    /getAllAssets`);
+    console.log(`- POST   /createAsset`);
+    console.log(`- GET    /readAsset/:id`);
+    console.log(`- POST   /transferAsset`);
+});
+
+// Original functions remain unchanged below
 async function newGrpcConnection(): Promise<grpc.Client> {
     const tlsRootCert = await fs.readFile(tlsCertPath);
     const tlsCredentials = grpc.credentials.createSsl(tlsRootCert);
@@ -127,88 +296,58 @@ async function newSigner(): Promise<Signer> {
     return signers.newPrivateKeySigner(privateKey);
 }
 
-/**
- * This type of transaction would typically only be run once by an application the first time it was started after its
- * initial deployment. A new version of the chaincode deployed later would likely not need to run an "init" function.
- */
 async function initLedger(contract: Contract): Promise<void> {
     console.log('\n--> Submit Transaction: InitLedger, function creates the initial set of assets on the ledger');
-
     await contract.submitTransaction('InitLedger');
-
     console.log('*** Transaction committed successfully');
 }
 
-/**
- * Evaluate a transaction to query ledger state.
- */
 async function getAllAssets(contract: Contract): Promise<void> {
     console.log('\n--> Evaluate Transaction: GetAllAssets, function returns all the current assets on the ledger');
-
     const resultBytes = await contract.evaluateTransaction('GetAllAssets');
-
     const resultJson = utf8Decoder.decode(resultBytes);
     const result: unknown = JSON.parse(resultJson);
     console.log('*** Result:', result);
 }
 
-/**
- * Submit a transaction synchronously, blocking until it has been committed to the ledger.
- */
 async function createAsset(contract: Contract): Promise<void> {
     console.log('\n--> Submit Transaction: CreateAsset, creates new asset with ID, Color, Size, Owner and AppraisedValue arguments');
-
     await contract.submitTransaction(
         'CreateAsset',
         assetId,
-        'yellow',
+        'blue',
         '5',
-        'Tom',
-        '1300',
+        'Tomoko',
+        '300',
     );
-
     console.log('*** Transaction committed successfully');
 }
 
-/**
- * Submit transaction asynchronously, allowing the application to process the smart contract response (e.g. update a UI)
- * while waiting for the commit notification.
- */
 async function transferAssetAsync(contract: Contract): Promise<void> {
     console.log('\n--> Async Submit Transaction: TransferAsset, updates existing asset owner');
-
     const commit = await contract.submitAsync('TransferAsset', {
         arguments: [assetId, 'Saptha'],
     });
     const oldOwner = utf8Decoder.decode(commit.getResult());
-
     console.log(`*** Successfully submitted transaction to transfer ownership from ${oldOwner} to Saptha`);
     console.log('*** Waiting for transaction commit');
-
     const status = await commit.getStatus();
     if (!status.successful) {
         throw new Error(`Transaction ${status.transactionId} failed to commit with status code ${String(status.code)}`);
     }
-
     console.log('*** Transaction committed successfully');
 }
 
 async function readAssetByID(contract: Contract): Promise<void> {
     console.log('\n--> Evaluate Transaction: ReadAsset, function returns asset attributes');
-
     const resultBytes = await contract.evaluateTransaction('ReadAsset', assetId);
-
     const resultJson = utf8Decoder.decode(resultBytes);
     const result: unknown = JSON.parse(resultJson);
     console.log('*** Result:', result);
 }
 
-/**
- * submitTransaction() will throw an error containing details of any error responses from the smart contract.
- */
 async function updateNonExistentAsset(contract: Contract): Promise<void>{
     console.log('\n--> Submit Transaction: UpdateAsset asset70, asset70 does not exist and should return an error');
-
     try {
         await contract.submitTransaction(
             'UpdateAsset',
@@ -224,16 +363,10 @@ async function updateNonExistentAsset(contract: Contract): Promise<void>{
     }
 }
 
-/**
- * envOrDefault() will return the value of an environment variable, or a default value if the variable is undefined.
- */
 function envOrDefault(key: string, defaultValue: string): string {
     return process.env[key] || defaultValue;
 }
 
-/**
- * displayInputParameters() will print the global scope parameters used by the main driver routine.
- */
 function displayInputParameters(): void {
     console.log(`channelName:       ${channelName}`);
     console.log(`chaincodeName:     ${chaincodeName}`);
