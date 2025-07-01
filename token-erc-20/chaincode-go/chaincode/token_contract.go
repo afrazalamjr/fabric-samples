@@ -11,10 +11,10 @@ import (
 )
 
 // Define key names for options
-const nameKey = "name"
-const symbolKey = "symbol"
+const nameKey = "UBLTOKEN"
+const symbolKey = "UBLT"
 const decimalsKey = "decimals"
-const totalSupplyKey = "totalSupply"
+const totalSupplyKey = "10000000" // This is the initial total supply of tokens, can be changed later
 
 // Define objectType names for prefix
 const allowancePrefix = "allowance"
